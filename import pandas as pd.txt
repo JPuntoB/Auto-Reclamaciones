@@ -1,0 +1,187 @@
+import pandas as pd
+import io
+import re
+import os
+from google.colab import files
+
+# ==========================================
+# 1. ESCÁNER DEL APARTADO DE ARCHIVOS
+# ==========================================
+print("📂 Escaneando los archivos subidos en el panel izquierdo de Colab...")
+
+directorio_actual = '/content'
+todos_los_archivos = os.listdir(directorio_actual)
+
+df_def_master = pd.DataFrame()
+df_facturas_master = pd.DataFrame()
+archivos_procesados = 0
+
+print("\n⚙️ Analizando y clasificando el contenido de los archivos por sus columnas...")
+
+for filename in todos_los_archivos:
+    nombre_lower = filename.lower()
+   
+    # Ignorar archivos del sistema
+    if not (nombre_lower.endswith('.xlsx') or nombre_lower.endswith('.xls') or nombre_lower.endswith('.csv')):
+        continue
+       
+    # 🔴 IGNORAR LA PLANTILLA VACÍA DEL COMPLAINT FORM
+    if "complaint" in nombre_lower and "form" in nombre_lower:
+        print(f"⚠️ {filename}: Ignorado (Es tu plantilla vacía).")
+        continue
+
+    try:
+        ruta_archivo = os.path.join(directorio_actual, filename)
+        df_raw = pd.read_excel(ruta_archivo)
+        header_idx = -1
+       
+        # Buscar dinámicamente la fila de cabeceras (donde esté el EAN)
+        for i, row in df_raw.iterrows():
+            if any(isinstance(val, str) and 'EAN' in str(val).upper() for val in row.values):
+                header_idx = i
+                break
+       
+        df = pd.read_excel(ruta_archivo, skiprows=header_idx + 1 if header_idx != -1 else 0)
+        col_ean = next((c for c in df.columns if 'EAN' in str(c).upper()), None)
+       
+        if not col_ean:
+            print(f"⚠️ {filename}: Ignorado (No contiene columna EAN para cruzar).")
+            continue
+           
+        archivos_procesados += 1
+        df['EAN_clean'] = df[col_ean].astype(str).str.replace('.0', '', regex=False).str.strip()
+       
+        # ==========================================
+        # 2. CLASIFICACIÓN INTELIGENTE POR CONTENIDO
+        # ==========================================
+        cols_upper = [str(c).upper() for c in df.columns]
+       
+        # Si el Excel tiene columnas típicas de Facturas o POs de Home Impex / Zalando
+        indicadores_bd = ['BIZONYLATSZÁM', 'PURCHASE ORDER NUMBER', 'QUANTITY CONFIRMED', 'PRICE/ITEM', 'INVOICE QTY']
+        es_base_datos = any(any(ind in c for ind in indicadores_bd) for c in cols_upper)
+       
+        if es_base_datos:
+            print(f"✅ {filename} -> Clasificado como: BASE DE DATOS (Factura/PO/Packing List)")
+            # Limpiar filas vacías si es factura (tiene Bizonylatszám)
+            col_biz = next((c for c in df.columns if 'BIZONYLATSZÁM' in str(c).upper()), None)
+            if col_biz:
+                df = df.dropna(subset=[col_biz])
+            df_facturas_master = pd.concat([df_facturas_master, df], ignore_index=True)
+           
+        else:
+            print(f"✅ {filename} -> Clasificado como: REPORTE DE QUEJAS (Faltantes/RSC/Defectos)")
+            # Buscar dinámicamente la columna de cantidades afectadas (a veces viene en negativo)
+            posibles_qty = ['DEFECT', 'MANQUANTS', 'DIFFERENCE', 'MISSING', 'SHORTAGE', 'QUANTITY', 'QTY']
+            col_qty = next((c for c in df.columns if any(p in str(c).upper() for p in posibles_qty)), None)
+           
+            if col_qty:
+                # Usamos abs() para convertir diferencias negativas (ej. -5) en cantidades positivas
+                df['Cantidad_Defecto'] = pd.to_numeric(df[col_qty], errors='coerce').abs()
+                df = df[df['Cantidad_Defecto'] > 0]
+            else:
+                df['Cantidad_Defecto'] = 1 # Si no hay columna clara, asume 1 unidad por defecto
+               
+            df_def_master = pd.concat([df_def_master, df], ignore_index=True)
+
+    except Exception as e:
+        print(f"❌ Error leyendo {filename}: {e}")
+
+# ==========================================
+# 3. CRUCE DE DATOS Y EXTRACCIÓN
+# ==========================================
+if df_def_master.empty:
+    print("\n✅ No hay artículos faltantes o defectuosos para procesar en los reportes.")
+elif df_facturas_master.empty:
+    print("\n❌ No se encontraron bases de datos (Facturas/POs) para cruzar la información.")
+else:
+    resultados = []
+   
+    for _, row in df_def_master.iterrows():
+        ean = row['EAN_clean']
+        ref = str(row.get('Ref.', row.get('Réf. fourn.', '[Sin Ref]')))
+       
+        # Búsqueda dinámica del Motivo de Queja
+        col_reason = next((c for c in df_def_master.columns if 'REASON' in str(c).upper() or 'MOTIVE' in str(c).upper() or 'COMMENT' in str(c).upper()), None)
+        reason = str(row[col_reason]) if col_reason and pd.notna(row[col_reason]) else ""
+       
+        qty_defect = str(int(row.get('Cantidad_Defecto', 1)))
+       
+        # Cruce con la base de datos maestra
+        match = df_facturas_master[df_facturas_master['EAN_clean'] == ean]
+       
+        if not match.empty:
+            fila_factura = match.iloc[-1]
+           
+            nombre = str(fila_factura.get('Product name', fila_factura.get('Supplier Article Name', '[Sin Nombre]'))).replace('\n', ' ').strip()
+            precio = fila_factura.get('Price/item', fila_factura.get('Purchase Order Price before Discount', fila_factura.get('Purchase Price after discounts before tax', fila_factura.get('Prix achat € HT', ''))))
+            factura_no = str(fila_factura.get('Bizonylatszám', fila_factura.get('Purchase Order Number', '(not found)')))
+           
+            # Cantidad total COMPRADA
+            qty_comprada = fila_factura.get('Quantity', fila_factura.get('Quantity Confirmed', fila_factura.get('Invoice Qty', '0')))
+           
+            if ref == '[Sin Ref]' or pd.isna(ref) or ref == 'nan':
+                ref = str(fila_factura.get('Item. no.', fila_factura.get('Supplier Article Number', '[Sin Ref]')))
+        else:
+            nombre = "[Falta Factura]"
+            precio = row.get('Average Purchase Price', '')
+            factura_no = "(not found)"
+            qty_comprada = "0"
+       
+        # Limpieza final de formatos
+        if pd.notna(qty_comprada) and isinstance(qty_comprada, (int, float)):
+            qty_comprada = str(int(qty_comprada))
+        else:
+            qty_comprada = str(qty_comprada)
+           
+        if pd.notna(precio) and isinstance(precio, (int, float)):
+            precio = f"{precio:.2f}".replace('.', ',')
+        else:
+            precio = str(precio)
+           
+        resultados.append({
+            "CIKKSZÁM / ITEM NUMBER": ref,
+            "MEGNEVEZÉS / NAME": nombre,
+            "VÁSÁROLT DB / PURCHASED PCS": qty_comprada,
+            "NETTÓ ÁR/DB": precio,
+            "INVOICE NO.": factura_no,
+            "PANASZ OKA / REASON FOR COMPLAINT": reason
+        })
+
+    df_final = pd.DataFrame(resultados)
+   
+    # ==========================================
+    # 4. SALIDA DE DATOS Y DESCARGA CSV
+    # ==========================================
+    print(f"\n🔍 RESULTADOS CONSOLIDADOS:")
+   
+    w_ref, w_nom, w_cant, w_precio, w_inv, w_rea = 26, 60, 31, 15, 15, 30
+   
+    header = (
+        "CIKKSZÁM / ITEM NUMBER".ljust(w_ref) +
+        "MEGNEVEZÉS / NAME".ljust(w_nom) +
+        "VÁSÁROLT DB / PURCHASED PCS".ljust(w_cant) +
+        "NETTÓ ÁR/DB".ljust(w_precio) +
+        "INVOICE NO.".ljust(w_inv) +
+        "PANASZ OKA / REASON FOR COMPLAINT".ljust(w_rea)
+    )
+    print("-" * len(header))
+    print(header)
+    print("-" * len(header))
+   
+    for _, row in df_final.iterrows():
+        linea = (
+            str(row['CIKKSZÁM / ITEM NUMBER']).ljust(w_ref) +
+            str(row['MEGNEVEZÉS / NAME'])[:58].ljust(w_nom) +
+            str(row['VÁSÁROLT DB / PURCHASED PCS']).ljust(w_cant) +
+            str(row['NETTÓ ÁR/DB']).ljust(w_precio) +
+            str(row['INVOICE NO.']).ljust(w_inv) +
+            str(row['PANASZ OKA / REASON FOR COMPLAINT'])[:28].ljust(w_rea)
+        )
+        print(linea)
+    print("-" * len(header))
+   
+    output_filename = "LISTO_Complaint_Zalando_Consolidado.csv"
+    df_final.to_csv(output_filename, index=False, sep=';', encoding='utf-8-sig')
+   
+    print(f"\n⬇️ Descargando archivo limpio para ti: {output_filename}...\n")
+    files.download(output_filename)
